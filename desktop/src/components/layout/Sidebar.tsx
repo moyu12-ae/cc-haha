@@ -1657,17 +1657,21 @@ function normalizeProjectKeyList(values: unknown): string[] {
 }
 
 function normalizeProjectPathForComparison(value: string): string {
-  const normalized = value.replace(/\\/g, '/').replace(/\/+$/g, '')
-  return normalized || value
+  const normalized = value.replace(/\\/g, '/').replace(/\/+$/g, '') || value
+  return isWindows ? normalized.toLowerCase() : normalized
+}
+
+function isDriveRootComparisonPath(value: string): boolean {
+  return /^[a-z]:$/i.test(value)
 }
 
 function projectPathMatches(projectKey: string, workDir: string): boolean {
   const normalizedProjectKey = normalizeProjectPathForComparison(projectKey)
   const normalizedWorkDir = normalizeProjectPathForComparison(workDir)
 
-  return normalizedProjectKey === normalizedWorkDir
-    || normalizedWorkDir.startsWith(`${normalizedProjectKey}/`)
-    || normalizedProjectKey.startsWith(`${normalizedWorkDir}/`)
+  if (normalizedProjectKey === normalizedWorkDir) return true
+  if (isDriveRootComparisonPath(normalizedProjectKey)) return false
+  return normalizedWorkDir.startsWith(`${normalizedProjectKey}/`)
 }
 
 function hasSidebarProjectPreferences(preferences: SidebarProjectPreferences): boolean {

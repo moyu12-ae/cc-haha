@@ -1030,7 +1030,7 @@ export class WorkspaceService {
       return {
         kind: 'ok',
         workspaceRoot: workDir,
-        canonicalWorkspaceRoot: await fs.realpath(workDir),
+        canonicalWorkspaceRoot: normalizeDriveRootPathForPlatform(await fs.realpath(workDir)),
       }
     } catch (error) {
       return {

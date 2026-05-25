@@ -366,7 +366,7 @@ export class SessionService {
 
   private async canonicalizeProjectPath(projectPath: string): Promise<string> {
     try {
-      return (await fs.realpath(projectPath)).normalize('NFC')
+      return normalizeDriveRootPathForPlatform(await fs.realpath(projectPath)).normalize('NFC')
     } catch {
       return projectPath.normalize('NFC')
     }

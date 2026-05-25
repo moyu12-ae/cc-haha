@@ -172,7 +172,7 @@ async function resolveDirectory(workDir: string): Promise<string> {
   const resolved = path.resolve(normalizeDriveRootPathForPlatform(workDir))
   let realPath: string
   try {
-    realPath = await fs.realpath(resolved)
+    realPath = normalizeDriveRootPathForPlatform(await fs.realpath(resolved))
   } catch {
     throw repositoryBadRequest(
       REPOSITORY_ERROR.workdirMissing,
