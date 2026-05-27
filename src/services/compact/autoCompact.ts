@@ -363,7 +363,7 @@ export function computeCacheMetrics(usage: {
   )
   const totalPromptTokens = cacheHitTokens + cacheMissTokens + cacheWriteTokens
   const cacheHitRatio =
-    totalPromptTokens > 0
+    totalPromptTokens > 0 && (cacheHitTokens + cacheMissTokens) > 0
       ? cacheHitTokens / (cacheHitTokens + cacheMissTokens)
       : 0
 
