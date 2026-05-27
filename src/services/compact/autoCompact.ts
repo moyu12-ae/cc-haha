@@ -57,6 +57,10 @@ export type AutoCompactTrackingState = {
   // Used as a circuit breaker to stop retrying when the context is
   // irrecoverably over the limit (e.g., prompt_too_long).
   consecutiveFailures?: number
+  // True when compaction has already run this turn (prevents double-fold).
+  // Mirrors Reasonix's alreadyFoldedThisTurn — the post-response check
+  // should not trigger a second fold if the pre-check already folded.
+  alreadyFoldedThisTurn?: boolean
 }
 
 export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
@@ -281,6 +285,110 @@ export function estimateTurnStartUsage(
   return { estimateTokens: dynamicTokens, ratio }
 }
 
+// Hysteresis buffer: only trigger a second pre-fold when context grows by
+// at least this ratio beyond the threshold, preventing oscillation when
+// context hovers right at the boundary.
+export const COMPACT_PRECHECK_FOLD_HYSTERESIS = 0.05
+
+/**
+ * Check whether the turn-start pre-estimation triggers a pre-fold.
+ *
+ * This is NOT redundant with shouldAutoCompact — it uses the 90% threshold
+ * (vs 75%) and is called BEFORE the API call, catching the case where the
+ * last turn's tool output pushed context way up but no assistant response
+ * carried the usage data yet.
+ *
+ * The hysteresis buffer prevents oscillating fold/no-fold when token counts
+ * hover near the threshold (Reasonix: requireTailBoundary equivalent).
+ *
+ * @returns true when a pre-fold is recommended before the next API call
+ */
+export function needsTurnStartPreFold(
+  estimateTokens: number,
+  effectiveWindow: number,
+  lastPreFoldTokens?: number,
+): boolean {
+  const threshold = Math.floor(effectiveWindow * COMPACT_PRECHECK_FOLD_RATIO)
+  if (estimateTokens < threshold) return false
+
+  // Hysteresis: if we pre-folded recently, only re-trigger when context
+  // has grown significantly beyond the threshold (avoids oscillation).
+  if (lastPreFoldTokens !== undefined && lastPreFoldTokens > 0) {
+    const hysteresisThreshold = Math.floor(
+      threshold * (1 + COMPACT_PRECHECK_FOLD_HYSTERESIS),
+    )
+    if (estimateTokens < hysteresisThreshold) return false
+  }
+
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Cache Economics — per-session cache hit/miss tracking (Reasonix SessionStats)
+// ---------------------------------------------------------------------------
+
+/** Per-turn cache metrics extracted from API usage data */
+export type CacheMetrics = {
+  /** Tokens read from prompt cache (HIT) */
+  cacheHitTokens: number
+  /** Tokens NOT read from cache — fresh input (MISS) */
+  cacheMissTokens: number
+  /** Tokens written to cache by this request */
+  cacheWriteTokens: number
+  /** Total prompt-side tokens (hit + miss + write = input_tokens total) */
+  totalPromptTokens: number
+  /** Cache hit ratio: hit / (hit + miss). 1.0 = perfect cache, 0.0 = all miss */
+  cacheHitRatio: number
+}
+
+/**
+ * Compute cache efficiency metrics from API usage data.
+ *
+ * Uses Anthropic's `cache_read_input_tokens` and `cache_creation_input_tokens`
+ * fields. For other providers (DeepSeek, OpenAI) that use different field names,
+ * the caller should normalize before passing.
+ *
+ * Pure function — no side effects, no state. Safe to call in any context.
+ */
+export function computeCacheMetrics(usage: {
+  input_tokens: number
+  cache_read_input_tokens?: number | null
+  cache_creation_input_tokens?: number | null
+}): CacheMetrics {
+  const cacheHitTokens = usage.cache_read_input_tokens ?? 0
+  const cacheWriteTokens = usage.cache_creation_input_tokens ?? 0
+  const cacheMissTokens = Math.max(
+    0,
+    usage.input_tokens - cacheHitTokens - cacheWriteTokens,
+  )
+  const totalPromptTokens = cacheHitTokens + cacheMissTokens + cacheWriteTokens
+  const cacheHitRatio =
+    totalPromptTokens > 0
+      ? cacheHitTokens / (cacheHitTokens + cacheMissTokens)
+      : 0
+
+  return {
+    cacheHitTokens,
+    cacheMissTokens,
+    cacheWriteTokens,
+    totalPromptTokens,
+    cacheHitRatio,
+  }
+}
+
+/**
+ * The pre-fold decision needs `alreadyFoldedThisTurn` context — exported so
+ * query.ts can thread it without reaching into tracking internals.
+ */
+export function shouldPreFold(
+  tracking: AutoCompactTrackingState | undefined,
+  estimateTokens: number,
+  effectiveWindow: number,
+): boolean {
+  if (tracking?.alreadyFoldedThisTurn) return false
+  return needsTurnStartPreFold(estimateTokens, effectiveWindow)
+}
+
 export function calculateTokenWarningState(
   tokenUsage: number,
   model: string,
@@ -450,10 +558,14 @@ export async function autoCompactIfNeeded(
   querySource?: QuerySource,
   tracking?: AutoCompactTrackingState,
   snipTokensFreed?: number,
+  /** Pass true from query.ts turn-start pre-estimation to run a pre-fold */
+  forcePreFold?: boolean,
 ): Promise<{
   wasCompacted: boolean
   compactionResult?: CompactionResult
   consecutiveFailures?: number
+  /** Loggable cache metrics from the compaction call (if one ran) */
+  cacheMetrics?: CacheMetrics
 }> {
   if (isEnvTruthy(process.env.DISABLE_COMPACT)) {
     return { wasCompacted: false }
@@ -477,14 +589,40 @@ export async function autoCompactIfNeeded(
     snipTokensFreed,
   )
 
-  if (!shouldCompact) {
+  // alreadyFoldedThisTurn guard: if compaction ran via pre-fold earlier this
+  // turn, the post-response check should not re-trigger. Mirrors Reasonix's
+  // decideAfterUsage: alreadyFoldedThisTurn → skip fold.
+  if (!forcePreFold && tracking?.alreadyFoldedThisTurn) {
+    logForDebugging('autocompact: skipping post-response check — already folded this turn')
     return { wasCompacted: false }
+  }
+
+  if (!shouldCompact && !forcePreFold) {
+    return { wasCompacted: false }
+  }
+
+  // Route decision: forcePreFold overrides the passive check when the
+  // turn-start pre-estimation flagged us above 90%. In that case we only
+  // skip if the minimum savings check says there's nothing worth freeing.
+  if (!shouldCompact && forcePreFold) {
+    const tokenCount = tokenCountWithEstimation(messages) - (snipTokensFreed ?? 0)
+    const effectiveWindow = getEffectiveContextWindowSize(model)
+    if (!isCompactionWorthwhile(tokenCount, effectiveWindow)) {
+      logForDebugging(
+        `autocompact: skipping forced pre-fold — head portion too small (tokens=${tokenCount}, window=${effectiveWindow})`,
+      )
+      return { wasCompacted: false }
+    }
+    logForDebugging(
+      `autocompact: forcePreFold active — triggering pre-fold (tokens=${tokenCount})`,
+    )
   }
 
   // Minimum savings gate: skip compaction when the head portion is too small
   // to save meaningful tokens. Prevents wasting a compact API call when the
   // summary alone costs nearly as many tokens as it frees.
-  if (isPercentageCompactionEnabled()) {
+  // Skip this check for forcePreFold — already handled above.
+  if (!forcePreFold && isPercentageCompactionEnabled()) {
     const tokenCount = tokenCountWithEstimation(messages) - (snipTokensFreed ?? 0)
     const effectiveWindow = getEffectiveContextWindowSize(model)
     if (
@@ -529,12 +667,13 @@ export async function autoCompactIfNeeded(
     runPostCompactCleanup(querySource)
     // Reset cache read baseline so the post-compact drop isn't flagged as a
     // break. compactConversation does this internally; SM-compact doesn't.
-    // BQ 2026-03-01: missing this made 20% of tengu_prompt_cache_break events
-    // false positives (systemPromptChanged=true, timeSinceLastAssistantMsg=-1).
     if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
       notifyCompaction(querySource ?? 'compact', toolUseContext.agentId)
     }
     markPostCompaction()
+    // Mark alreadyFoldedThisTurn to prevent the post-response check from
+    // double-folding (Reasonix: decideAfterUsage returns 'none' when true).
+    if (tracking) tracking.alreadyFoldedThisTurn = true
     return {
       wasCompacted: true,
       compactionResult: sessionMemoryResult,
@@ -557,11 +696,25 @@ export async function autoCompactIfNeeded(
     setLastSummarizedMessageId(undefined)
     runPostCompactCleanup(querySource)
 
+    // Compute cache metrics from the compaction agent's usage for visibility
+    const compactionUsage = compactionResult.compactionUsage
+    const compactionCacheMetrics = compactionUsage
+      ? computeCacheMetrics({
+          input_tokens: compactionUsage.input_tokens,
+          cache_read_input_tokens: compactionUsage.cache_read_input_tokens,
+          cache_creation_input_tokens: compactionUsage.cache_creation_input_tokens,
+        })
+      : undefined
+
+    // Mark alreadyFoldedThisTurn to prevent the post-response check from
+    // double-folding (Reasonix: decideAfterUsage returns 'none' when true).
+    if (tracking) tracking.alreadyFoldedThisTurn = true
+
     return {
       wasCompacted: true,
       compactionResult,
-      // Reset failure count on success
       consecutiveFailures: 0,
+      cacheMetrics: compactionCacheMetrics,
     }
   } catch (error) {
     if (!hasExactErrorMessage(error, ERROR_MESSAGE_USER_ABORT)) {

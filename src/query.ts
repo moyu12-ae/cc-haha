@@ -11,7 +11,9 @@ import {
   estimateTurnStartUsage,
   getEffectiveContextWindowSize,
   isAutoCompactEnabled,
+  shouldPreFold,
   type AutoCompactTrackingState,
+  type CacheMetrics,
 } from './services/compact/autoCompact.js'
 import { buildPostCompactMessages } from './services/compact/compact.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -456,31 +458,46 @@ async function* queryLoop(
 
     queryCheckpoint('query_autocompact_start')
 
-    // Turn-start pre-estimation: log a diagnostic signal before the autocompact
-    // check so we can observe whether the context was already near capacity
-    // before the next API call. The existing autocompact path (line below)
-    // handles the actual trigger via percentage-based thresholds (75%/78%/80%).
-    // This checkpoint is purely for observability.
+    // Turn-start pre-estimation: check whether accumulated context from the
+    // last turn has pushed us into dangerous territory BEFORE the next API
+    // call. When the 90% threshold is crossed and we haven't already folded
+    // this turn, force a pre-fold via the existing autocompact pipeline.
+    let forcePreFold = false
     if (feature('TURN_START_PRE_ESTIMATION')) {
+      const effectiveWindow = getEffectiveContextWindowSize(
+        toolUseContext.options.mainLoopModel,
+      )
       const { ratio, estimateTokens } = estimateTurnStartUsage(
         messagesForQuery,
-        getEffectiveContextWindowSize(toolUseContext.options.mainLoopModel),
+        effectiveWindow,
       )
-      if (ratio >= COMPACT_PRECHECK_FOLD_RATIO) {
+      if (
+        shouldPreFold(tracking, estimateTokens, effectiveWindow)
+      ) {
+        forcePreFold = true
         logForDebugging(
           `turnStartPreEstimate: context at ${(ratio * 100).toFixed(1)}% ` +
-          `(~${estimateTokens.toLocaleString()} tokens) before API call — ` +
-          `pre-fold may be needed`,
+          `(~${estimateTokens.toLocaleString()} tokens) — forcing pre-fold before API call`,
           { level: 'warn' },
         )
-        logEvent('tengu_turn_start_prefold_detected', {
+        logEvent('tengu_turn_start_prefold_triggered', {
           estimatedTokens: estimateTokens,
           ratio: Math.round(ratio * 100),
         })
+      } else if (ratio >= COMPACT_PRECHECK_FOLD_RATIO) {
+        // Above threshold but suppressed by alreadyFoldedThisTurn
+        logForDebugging(
+          `turnStartPreEstimate: context at ${(ratio * 100).toFixed(1)}% ` +
+          `but pre-fold suppressed (already folded this turn)`,
+        )
       }
     }
 
-    const { compactionResult, consecutiveFailures } = await deps.autocompact(
+    const {
+      compactionResult,
+      consecutiveFailures,
+      cacheMetrics,
+    } = await deps.autocompact(
       messagesForQuery,
       toolUseContext,
       {
@@ -493,7 +510,18 @@ async function* queryLoop(
       querySource,
       tracking,
       snipTokensFreed,
+      forcePreFold,
     )
+    queryCheckpoint('query_autocompact_end')
+
+    if (cacheMetrics) {
+      logForDebugging(
+        `cacheMetrics.compaction: hit=${cacheMetrics.cacheHitTokens.toLocaleString()} ` +
+        `miss=${cacheMetrics.cacheMissTokens.toLocaleString()} ` +
+        `ratio=${(cacheMetrics.cacheHitRatio * 100).toFixed(1)}%`,
+      )
+    }
+
     queryCheckpoint('query_autocompact_end')
 
     if (compactionResult) {
